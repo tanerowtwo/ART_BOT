@@ -1,106 +1,83 @@
 import os
+import re
 import asyncio
-import random
-import aiohttp
 from aiohttp import web
-import google.generativeai as genai
 from aiogram import Bot, Dispatcher
-from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import CommandStart
 from aiogram.types import Message
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# === ENV ===
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-# Твой личный Telegram ID (число без минуса)
-TARGET_USER_ID = int(os.environ.get("TARGET_USER_ID", 0))
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-# Настройка Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
-
-# === СПИСОК ХУДОЖНИКОВ ===
-ARTISTS = [
-    "Михаил Врубель",
-    "Франсиско Гойя",
-    "Каспар Давид Фридрих",
-    "Гюстав Доре",
-    "Альбрехт Дюрер",
-    "Караваджо",
-    "Вильгельм Котарбинский",
-    "Здзислав Бексиньский",
-    "Рембрандт",
-    "Ян Вермеер",
-    "Эдвард Хоппер",
-    "Уильям Тернер",
-    "Илья Репин",
-    "Клод Моне",
-    "Диего Веласкес"
-]
+DATA_FILE = "cards.md"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-async def fetch_artist_info(artist_name: str) -> str:
-    prompt = f"""
-    Сделай краткий, но емкий ресерч по художнику: {artist_name}. 
-    Ты помогаешь видеооператору изучать живопись для вдохновения (работа со светом, композиция, цвет).
+def load_cards():
+    """Загружает все карточки из файла cards.md."""
+    if not os.path.exists(DATA_FILE):
+        return []
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        content = f.read()
     
-    Выдай ответ строго в чистом HTML формате без лишних Markdown символов вроде ```html:
-    🎨 <b>Имя:</b> {artist_name}
-    ⏳ <b>Годы жизни:</b> [годы]
-    🏛 <b>Эпоха:</b> [эпоха]
-    🖌 <b>Стиль:</b> [стиль]
-    
-    🖼 <b>Самые значимые картины:</b>
-    - [Название]
-    - [Название]
-    
-    🎬 <b>Операторский фокус:</b> [1-2 предложения: работа со светом, кьяроскуро, цветовой контраст или работа с планами]
-    
-    🔗 <b>Где почитать:</b>
-    1. <a href="[ссылка]">[Название ресурса]</a>
-    2. <a href="[ссылка]">[Название ресурса]</a>
-    """
-    try:
-        response = await model.generate_content_async(prompt)
-        text = response.text
-        text = text.replace("```html", "").replace("```", "").strip()
-        return text
-    except Exception as e:
-        return f"❌ Ошибка при поиске информации о {artist_name}:\n{e}"
+    # Разделяем по тегам <!-- START_CARD: DAY_\d+ -->
+    cards = re.split(r'<!-- START_CARD: DAY_\d+ -->', content)
+    cleaned_cards = []
+    for card in cards:
+        card_text = card.replace('<!-- END_CARD -->', '').strip()
+        if card_text:
+            cleaned_cards.append(card_text)
+    return cleaned_cards
 
-async def send_daily_artist():
-    if not TARGET_USER_ID:
-        print("❌ Ошибка: TARGET_USER_ID не задан в переменной окружения!")
+async def get_saved_index(chat_id: int) -> int:
+    """Считывает сохраненный индекс из закрепленного сообщения."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        if chat.pinned_message and chat.pinned_message.text.startswith("INDEX:"):
+            return int(chat.pinned_message.text.split(":")[1])
+    except Exception:
+        pass
+    return 0
+
+async def save_index(chat_id: int, index: int):
+    """Обновляет закрепленное сообщение с новым индексом."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        text = f"INDEX:{index}"
+        
+        if chat.pinned_message and chat.pinned_message.text.startswith("INDEX:"):
+            # Редактируем существующий закреп
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=chat.pinned_message.message_id)
+        else:
+            # Создаем новый закреп, если его не было
+            msg = await bot.send_message(chat_id, text)
+            await bot.pin_chat_message(chat_id, msg.message_id)
+    except Exception as e:
+        print(f"Ошибка сохранения прогресса: {e}")
+
+@dp.message(CommandStart())
+async def send_next_artist(message: Message):
+    cards = load_cards()
+    
+    if not cards:
+        await message.answer("❌ Ошибка: Файл cards.md не найден или пуст.")
         return
 
-    if not ARTISTS:
-        await bot.send_message(TARGET_USER_ID, "Списки художников закончились!")
+    index = await get_saved_index(message.chat.id)
+
+    if index >= len(cards):
+        await message.answer("🎉 Вы прошли весь список художников!")
         return
 
-    artist = random.choice(ARTISTS)
-    print(f"🔍 Сбор данных по: {artist}...")
-    info = await fetch_artist_info(artist)
-    
-    try:
-        await bot.send_message(
-            TARGET_USER_ID, 
-            info, 
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True
-        )
-        print("✅ Пост про художника успешно отправлен в личку!")
-    except Exception as e:
-        print(f"❌ Ошибка парсинга HTML, отправка простым текстом: {e}")
-        await bot.send_message(TARGET_USER_ID, info, disable_web_page_preview=True)
+    card_text = cards[index]
 
-# Реакция на команды /start и /test в личке
-@dp.message(Command("start", "test"))
-async def cmd_test(message: Message):
-    await message.answer("🛠 Генерирую карточку художника...")
-    await send_daily_artist()
+    try:
+        await message.answer(card_text, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception:
+        # Резервный вариант, если в тексте спецсимволы
+        await message.answer(card_text, disable_web_page_preview=True)
+
+    # Сохраняем следующий индекс в Telegram
+    await save_index(message.chat.id, index + 1)
 
 # === HTTP SERVER ДЛЯ UPTIMEROBOT ===
 async def handle(request):
@@ -121,27 +98,9 @@ async def web_server():
 
 # === MAIN ===
 async def main():
-    print("🤖 Бот запущен")
-    
+    print("🤖 Бот запущен...")
     await web_server()
-    
-    scheduler = AsyncIOScheduler(timezone="Asia/Yekaterinburg")
-    scheduler.add_job(
-        send_daily_artist, 
-        trigger='cron', 
-        hour=9, 
-        minute=0, 
-        misfire_grace_time=3600
-    )
-    scheduler.start()
-    print("⏰ Расписание настроено на 09:00 (Екб)")
-
     await bot.delete_webhook(drop_pending_updates=True)
-
-    # 🚀 ТЕСТОВЫЙ ЗАПУСК ПРИ СТАРТЕ СЕРВЕРА
-    print("🧪 Выполняю тестовую отправку в личку...")
-    asyncio.create_task(send_daily_artist())
-
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

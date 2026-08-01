@@ -5,13 +5,16 @@ import aiohttp
 from aiohttp import web
 import google.generativeai as genai
 from aiogram import Bot, Dispatcher
+from aiogram.enums import ParseMode
+from aiogram.filters import Command
+from aiogram.types import Message
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # === ENV ===
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-TARGET_USER_ID = int(os.environ["TARGET_USER_ID"])
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-RENDER_APP_URL = os.environ.get("RENDER_APP_URL", "https://your-app-name.onrender.com")
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# Твой личный Telegram ID (число без минуса)
+TARGET_USER_ID = int(os.environ.get("TARGET_USER_ID", 0))
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Настройка Gemini
 genai.configure(api_key=GEMINI_API_KEY)
@@ -44,49 +47,64 @@ async def fetch_artist_info(artist_name: str) -> str:
     Сделай краткий, но емкий ресерч по художнику: {artist_name}. 
     Ты помогаешь видеооператору изучать живопись для вдохновения (работа со светом, композиция, цвет).
     
-    Выдай ответ строго в таком формате (используй HTML-теги для красоты):
+    Выдай ответ строго в чистом HTML формате без лишних Markdown символов вроде ```html:
     🎨 <b>Имя:</b> {artist_name}
     ⏳ <b>Годы жизни:</b> [годы]
     🏛 <b>Эпоха:</b> [эпоха]
     🖌 <b>Стиль:</b> [стиль]
     
-    🖼 <b>Самые значимые картины (3-5 шт):</b>
+    🖼 <b>Самые значимые картины:</b>
     - [Название]
     - [Название]
     
-    🔗 <b>Где почитать (3 качественные ссылки на статьи, Википедию или арт-блоги):</b>
+    🎬 <b>Операторский фокус:</b> [1-2 предложения: работа со светом, кьяроскуро, цветовой контраст или работа с планами]
+    
+    🔗 <b>Где почитать:</b>
     1. <a href="[ссылка]">[Название ресурса]</a>
     2. <a href="[ссылка]">[Название ресурса]</a>
-    3. <a href="[ссылка]">[Название ресурса]</a>
     """
     try:
-        response = model.generate_content(prompt)
-        return response.text
+        response = await model.generate_content_async(prompt)
+        text = response.text
+        text = text.replace("```html", "").replace("```", "").strip()
+        return text
     except Exception as e:
         return f"❌ Ошибка при поиске информации о {artist_name}:\n{e}"
 
 async def send_daily_artist():
+    if not TARGET_USER_ID:
+        print("❌ Ошибка: TARGET_USER_ID не задан в переменной окружения!")
+        return
+
     if not ARTISTS:
         await bot.send_message(TARGET_USER_ID, "Списки художников закончились!")
         return
 
     artist = random.choice(ARTISTS)
-    ARTISTS.remove(artist) 
-    
     print(f"🔍 Сбор данных по: {artist}...")
     info = await fetch_artist_info(artist)
     
-    await bot.send_message(
-        TARGET_USER_ID, 
-        info, 
-        parse_mode="HTML",
-        disable_web_page_preview=True
-    )
-    print("✅ Пост про художника отправлен!")
+    try:
+        await bot.send_message(
+            TARGET_USER_ID, 
+            info, 
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True
+        )
+        print("✅ Пост про художника успешно отправлен в личку!")
+    except Exception as e:
+        print(f"❌ Ошибка парсинга HTML, отправка простым текстом: {e}")
+        await bot.send_message(TARGET_USER_ID, info, disable_web_page_preview=True)
 
-# === HTTP SERVER ДЛЯ RENDER ===
+# Реакция на команды /start и /test в личке
+@dp.message(Command("start", "test"))
+async def cmd_test(message: Message):
+    await message.answer("🛠 Генерирую карточку художника...")
+    await send_daily_artist()
+
+# === HTTP SERVER ДЛЯ UPTIMEROBOT ===
 async def handle(request):
-    return web.Response(text="Бот-искусствовед активен!")
+    return web.Response(text="OK", status=200)
 
 async def web_server():
     app = web.Application()
@@ -101,35 +119,29 @@ async def web_server():
     await site.start()
     print("🌐 Внутренний веб-сервер запущен")
 
-# === KEEP ALIVE (Пинг внешнего URL, чтобы не спать) ===
-async def keep_alive():
-    await asyncio.sleep(30)  # Даем время на запуск
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(RENDER_APP_URL, timeout=10) as response:
-                    print(f"🔄 Ping OK. Статус: {response.status}")
-        except Exception as e:
-            print(f"❌ Ping fail: {e}")
-        await asyncio.sleep(120)  # Пингуем каждые 2 минуты
-
 # === MAIN ===
 async def main():
     print("🤖 Бот запущен")
     
-    # Запускаем веб-сервер, чтобы Render не ругался на отсутствие порта
     await web_server()
     
-    # Запускаем планировщик
     scheduler = AsyncIOScheduler(timezone="Asia/Yekaterinburg")
-    scheduler.add_job(send_daily_artist, trigger='cron', hour=9, minute=0)
+    scheduler.add_job(
+        send_daily_artist, 
+        trigger='cron', 
+        hour=9, 
+        minute=0, 
+        misfire_grace_time=3600
+    )
     scheduler.start()
     print("⏰ Расписание настроено на 09:00 (Екб)")
 
-    # Фоновое удержание от сна
-    asyncio.create_task(keep_alive())
+    await bot.delete_webhook(drop_pending_updates=True)
 
-    # Запуск поллинга aiogram
+    # 🚀 ТЕСТОВЫЙ ЗАПУСК ПРИ СТАРТЕ СЕРВЕРА
+    print("🧪 Выполняю тестовую отправку в личку...")
+    asyncio.create_task(send_daily_artist())
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
